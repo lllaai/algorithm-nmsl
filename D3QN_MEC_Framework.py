@@ -1,468 +1,439 @@
+import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import random
-from collections import deque
-import copy
 
-# ==========================================
-# 0. 固定随机种子
-# ==========================================
-def setup_seed(seed):
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
 
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+# ========== 设备：优先使用 MPS ==========
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
 
-    torch.backends.cudnn.deterministic = True
 
-setup_seed(42)
+DEVICE = get_device()
+print("Using device:", DEVICE)
 
-# ==========================================
-# 1. 配置参数
-# ==========================================
-class Config:
-    def __init__(self):
-        self.num_users = 20
-        self.num_services = 40
-        self.cache_capacity = 10
-        self.num_channels = 5
 
-        # 状态是长度为 num_services+1 的直方图
-        self.feature_dim = self.num_services + 1
-
-        # RL 参数
-        self.gamma = 0.95
-        self.epsilon_start = 1.0
-        self.epsilon_end = 0.05  # 保持 5% 的随机性
-        self.epsilon_decay = 0.9995  # 衰减极慢
-
-        self.learning_rate = 0.0003
-        self.batch_size = 64
-        self.memory_size = 10000
-        self.target_update = 200
-        self.hidden_dim_1 = 256
-        self.hidden_dim_2 = 256
-
-        self.task_input_sizes = np.random.uniform(0.5, 1.5, size=self.num_services)
-        self.service_sizes = np.random.randint(1, 4, size=self.num_services)
-        self.task_cycles = self.task_input_sizes * 0.5
-
-        self.time_slot_limit = 0.3
-        self.bandwidth = 20e6
-        self.noise_power = 1e-13
-        self.trans_power_user = 0.5
-
-        self.f_local = 1.0e9
-        self.f_edge = 20.0e9
-        self.f_cloud = 100.0e9
-        self.rate_fiber = 100 * 1e6
-
-        self.penalty = 2.0
-        self.zeta = 1e-28
-        self.p_exe_edge = 1.0
-        self.game_max_iter = 20
-
-        # 设备选择：MPS / CUDA / CPU
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
-
-        print("Using device:", self.device)
-
-cfg = Config()
-
-# ==========================================
-# 2. D3QN 模型 (支持 One-Hot)
-# ==========================================
-class D3QN_Network(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(D3QN_Network, self).__init__()
-        self.feature_layer = nn.Sequential(
-            nn.Linear(input_dim, cfg.hidden_dim_1),
-            nn.ReLU(),
-            nn.Linear(cfg.hidden_dim_1, cfg.hidden_dim_2),
-            nn.ReLU()
-        )
-        # V(s): 状态价值 (Scalar)
-        self.value_stream = nn.Sequential(
-            nn.Linear(cfg.hidden_dim_2, 1) 
-        )
-        # A(s, a): 每个服务的优势值 (Vector, size=num_services)
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(cfg.hidden_dim_2, output_dim)
-        )
-
-    def forward(self, state):
-        features = self.feature_layer(state)
-        values = self.value_stream(features)
-        advantages = self.advantage_stream(features)
-        # 关键修改：分别返回，不要在这里合并，因为合并逻辑取决于动作选择
-        return values, advantages
-
-# ==========================================
-# 3. 辅助函数：One-Hot 转换
-# ==========================================
-def to_onehot(state_arr, cfg):
+# ========== 按 Table I 参数的 MEC 环境 ==========
+class ServiceCachingEnvTable1:
     """
-    修改版：将状态转换为 [batch, num_services + 1] 的请求计数向量（直方图）
+    单 ES 版本，参数尽量按 Table I 设定：
+      - Number of tasks: K ≈ 40
+      - Number of MUs: 2000
+      - ES cache size C ∈ [3, 15] GB，这里默认取中间值 10
+      - CPU capability of ES: 20 GHz
+      - I_max = 8, D_max = 8
+      - τ = 300 ms
+      - replay buffer size E = 1000（在 Agent 里用）
     """
-    if len(state_arr.shape) == 1:
-        state_arr = state_arr[np.newaxis, :]
-    
-    batch_size = state_arr.shape[0]
-    num_classes = cfg.num_services + 1
-    
-    # 只需要统计每个服务被请求了多少次
-    hist_state = np.zeros((batch_size, num_classes), dtype=np.float32)
 
-    for i in range(batch_size):
-        for u in range(cfg.num_users):
-            val = int(state_arr[i, u])
-            hist_state[i, val] += 1.0 # 计数+1
+    def __init__(
+        self,
+        num_users=2000,
+        num_tasks=40,
+        cache_capacity_gb=10.0,  # Table I: [3, 15] GB，取 10
+        seed=0,
+    ):
+        self.U = num_users
+        self.K = num_tasks
+        self.C = cache_capacity_gb  # “容量单位”与 D_k 一致
 
-    # 可选：归一化，让数值在 0-1 之间，利于神经网络训练
-    hist_state = hist_state / cfg.num_users
-            
-    return hist_state
+        self.rng = np.random.default_rng(seed)
 
-# ==========================================
-# 4. 背包算法
-# ==========================================
-def solve_knapsack(q_values, sizes, capacity):
-    K = len(q_values)
-    C = int(capacity)
-    q_values = np.clip(q_values, 0, None) 
-    dp = np.zeros((K + 1, C + 1))
-    for i in range(1, K + 1):
-        w_item = int(sizes[i-1])
-        v_item = q_values[i-1]
-        for w in range(1, C + 1):
-            if w_item <= w:
-                dp[i][w] = max(dp[i-1][w], dp[i-1][w-w_item] + v_item)
-            else:
-                dp[i][w] = dp[i-1][w]
-    selected = np.zeros(K)
-    w = C
-    for i in range(K, 0, -1):
-        if dp[i][w] != dp[i-1][w]:
-            selected[i-1] = 1
-            w -= int(sizes[i-1])
-    return selected
+        # ===== 任务参数：I_k, D_k, S_k =====
+        # I_max = 8, D_max = 8（Table I），我们让 I_k, D_k 在 [1, 8] 均匀分布
+        self.I_k = self.rng.uniform(1.0, 8.0, size=self.K)     # 输入数据（相对单位）
+        self.D_k = self.rng.uniform(1.0, 8.0, size=self.K)     # 服务大小（“GB 单位”）
+        self.S_k = self.rng.uniform(10.0, 50.0, size=self.K)   # 计算量（抽象 CPU cycles）
 
-# ==========================================
-# 5. Agent (修正版：严格背包Target + 梯度控制)
-# ==========================================
-class D3QNAgent:
-    def __init__(self, config):
-        self.cfg = config
-        self.policy_net = D3QN_Network(config.feature_dim, config.num_services).to(config.device)
-        self.target_net = D3QN_Network(config.feature_dim, config.num_services).to(config.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
-        
-        # [修改] 降低学习率，防止 Sum Q 导致的梯度爆炸
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=1e-4)
-        
-        self.memory = deque(maxlen=config.memory_size)
-        self.loss_fn = nn.MSELoss()
-        self.epsilon = config.epsilon_start
-        self.steps = 0
+        # ===== 计算能力 / 时隙长度 =====
+        # ES CPU capability: 20 GHz
+        # 这里做归一化，把 f_e / f_c 看成“单位时间内可处理的 S_k 数量”
+        self.f_e = 20.0      # ES 计算能力（相对）
+        self.f_c = 50.0      # 云端计算能力（比边缘更强）
+        # τ = 300 ms，取 0.3 秒，再用作时延上限
+        self.tau = 0.3
 
-    def select_action(self, state):
-        self.steps += 1
-        state_onehot = to_onehot(state, self.cfg)
-        
-        if random.random() < self.epsilon:
-            # 随机探索：随机生成 Advantage 并解背包
-            # 这样保证随机出的动作也是符合物理约束的
-            random_adv = np.random.uniform(-1, 1, size=self.cfg.num_services)
-            action = solve_knapsack(random_adv, self.cfg.service_sizes, self.cfg.cache_capacity)
-        else:
-            with torch.no_grad():
-                state_tensor = torch.FloatTensor(state_onehot).to(self.cfg.device)
-                v, a = self.policy_net(state_tensor)
-                advantages = a.cpu().numpy()[0]
-                # Dueling Centering
-                advantages = advantages - advantages.mean()
-                action = solve_knapsack(advantages, self.cfg.service_sizes, self.cfg.cache_capacity)
-        return action
+        # 本地执行参数：E_local = ζ * f^2 * S_k
+        self.zeta = 1e-3
+        self.f_local_min = 5.0
 
-    def store_experience(self, state, action, reward, next_state):
-        self.memory.append((state, action, reward, next_state))
+        # 无线参数（简化版）
+        self.W = 5.0        # 单信道带宽
+        self.noise_power = 1.0
+        self.tx_power_mu = 1.0
 
-    def update(self):
-        if len(self.memory) < self.cfg.batch_size:
-            return 0.0
-        
-        batch = random.sample(self.memory, self.cfg.batch_size)
-        state, action, reward, next_state = zip(*batch)
-        
-        # 数据准备
-        state_onehot = to_onehot(np.array(state), self.cfg)
-        next_state_onehot = to_onehot(np.array(next_state), self.cfg)
-        
-        state_t = torch.FloatTensor(state_onehot).to(self.cfg.device)
-        action_t = torch.FloatTensor(np.array(action)).to(self.cfg.device)
-        reward_t = torch.FloatTensor(reward).unsqueeze(1).to(self.cfg.device)
-        next_state_t = torch.FloatTensor(next_state_onehot).to(self.cfg.device)
-        
-        # --- 1. 计算当前 Q 值 (Current Q) ---
-        curr_v, curr_a = self.policy_net(state_t)
-        curr_a_centered = curr_a - curr_a.mean(dim=1, keepdim=True)
-        
-        # AOF: Q = V + Sum(A * mask)
-        # 这一步计算的是"Agent实际采取的那个动作组合"的价值
-        current_q_value = curr_v + torch.sum(curr_a_centered * action_t, dim=1, keepdim=True)
-        
-        # --- 2. 计算目标 Q 值 (Target Q) - Double DQN ---
-        with torch.no_grad():
-            # A. 使用 Policy Net 决定"哪个是最佳动作组合" (Selection)
-            # 注意：必须解背包！不能用 TopK 近似！
-            next_v_eval, next_a_eval = self.policy_net(next_state_t)
-            next_a_eval_np = next_a_eval.cpu().numpy()
-            
-            # 在 CPU 上循环 Batch 解背包 (这是保证收敛的代价)
-            # 虽然慢，但保证了 Target Value 是物理可行的
-            best_next_actions = []
-            for i in range(self.cfg.batch_size):
-                adv = next_a_eval_np[i]
-                adv = adv - adv.mean() # Centering
-                # 解背包
-                act = solve_knapsack(adv, self.cfg.service_sizes, self.cfg.cache_capacity)
-                best_next_actions.append(act)
-            
-            best_next_actions = torch.FloatTensor(np.array(best_next_actions)).to(self.cfg.device)
-            
-            # B. 使用 Target Net 评估该动作组合的价值 (Evaluation)
-            next_v_target, next_a_target = self.target_net(next_state_t)
-            next_a_target_centered = next_a_target - next_a_target.mean(dim=1, keepdim=True)
-            
-            # 计算 Target Q
-            max_next_q = next_v_target + torch.sum(next_a_target_centered * best_next_actions, dim=1, keepdim=True)
-            
-            target_q_value = reward_t + self.cfg.gamma * max_next_q
+        # ES→云链路速率（有线链路）
+        self.r_ec = 20.0
 
-        loss = self.loss_fn(current_q_value, target_q_value)
-        
-        self.optimizer.zero_grad()
-        loss.backward()
-        
-        # [关键] 强力梯度裁剪，防止 Sum Q 导致的梯度爆炸
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
-        
-        self.optimizer.step()
-        
-        # Epsilon Decay
-        self.epsilon = max(self.cfg.epsilon_end, self.epsilon * self.cfg.epsilon_decay)
-        
-        return loss.item()
+        # 能耗系数（传输 / 执行）
+        self.p_edge_trans = 1.0
+        self.p_edge_exec = 1.0
+        self.p_cloud = 1.0
 
-    def update_target_network(self):
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        # 用户位置 / pathloss
+        self.area_size = 1000.0
+        self.pathloss_exp = 3.5
+        self.mu_positions = self._random_mu_positions()
 
-# ==========================================
-# 6. 物理环境
-# ==========================================
-class MECEnvironment:
-    def __init__(self, config):
-        self.cfg = config
-        self.user_locations = np.random.uniform(0, 1000, size=(config.num_users, 2))
-        self.bs_location = np.array([500, 500])
-        self.distances = np.linalg.norm(self.user_locations - self.bs_location, axis=1)
-        self.distances = np.maximum(self.distances, 10.0)
-        path_loss_exp = 4.0
-        self.gains = self.distances ** (-path_loss_exp)
-        self.rx_powers = self.cfg.trans_power_user * self.gains
+        # 状态：当前缓存与请求
+        self.beta_t = np.zeros(self.K, dtype=int)  # 当前缓存
+        self.xi_t = None                           # 当前请求（长度 U）
 
+    # ---------- 辅助：随机用户位置 ----------
+    def _random_mu_positions(self):
+        xs = self.rng.uniform(0, self.area_size, size=self.U)
+        ys = self.rng.uniform(0, self.area_size, size=self.U)
+        return np.stack([xs, ys], axis=1)
+
+    def _distance_to_bs(self, u):
+        bs = np.array([self.area_size / 2, self.area_size / 2])
+        return np.linalg.norm(self.mu_positions[u] - bs) + 1e-3
+
+    def _uplink_rate(self, u, n_users_on_same_channel=1):
+        d_u = self._distance_to_bs(u)
+        g_u = d_u ** (-self.pathloss_exp)
+        interference = (n_users_on_same_channel - 1) * self.tx_power_mu * g_u
+        sinr = self.tx_power_mu * g_u / (self.noise_power + interference)
+        rate = self.W * np.log2(1.0 + sinr)
+        return max(rate, 1e-3)
+
+    # ---------- MDP：reset / 状态表示 / step ----------
     def reset(self):
-        return self._generate_requests()
-    
-    def _calculate_cost_for_user(self, u, strategy, current_strategies, caching_decision, task_id):
-        # 1. Local
-        if strategy == 0:
-            S_k = self.cfg.task_cycles[task_id] * 1e9
-            t_local = S_k / self.cfg.f_local
-            e_local = self.cfg.zeta * (self.cfg.f_local**2) * S_k
-            if t_local > self.cfg.time_slot_limit:
-                e_local += self.cfg.penalty
-            return e_local
-
-        # 2. Offload
-        interference = 0
-        for v in range(self.cfg.num_users):
-            if v != u and current_strategies[v] == strategy:
-                interference += self.rx_powers[v]
-        
-        # [修正] 增加一点基底噪声防止除零或极端数值
-        sinr = self.rx_powers[u] / (self.cfg.noise_power + interference + 1e-9)
-        rate = self.cfg.bandwidth * np.log2(1 + sinr)
-        if rate < 1e3: rate = 1e3 
-        
-        k = task_id
-        I_k = self.cfg.task_input_sizes[k] * 8 * 1e6
-        S_k = self.cfg.task_cycles[k] * 1e9
-        
-        is_cached = (caching_decision[k] == 1)
-        
-        if is_cached:
-            # Edge
-            t_trans = I_k / rate
-            t_exe = S_k / self.cfg.f_edge
-            delay = t_trans + t_exe
-            energy = self.cfg.trans_power_user * t_trans + self.cfg.p_exe_edge * t_exe
-        else:
-            # Cloud (Fiber Bottleneck)
-            t_trans_edge = I_k / rate
-            t_trans_fiber = I_k / self.cfg.rate_fiber
-            t_exe_cloud = S_k / self.cfg.f_cloud
-            delay = t_trans_edge + t_trans_fiber + t_exe_cloud
-            energy = self.cfg.trans_power_user * (t_trans_edge + t_trans_fiber)
-            
-        if delay > self.cfg.time_slot_limit:
-            energy += self.cfg.penalty
-            
-        return energy
-
-    def find_nash_equilibrium(self, caching_decision, user_requests):
-        strategies = np.zeros(self.cfg.num_users, dtype=int)
-        active_users = [u for u in range(self.cfg.num_users) if user_requests[u] > 0]
-        
-        for it in range(self.cfg.game_max_iter):
-            changed = False
-            np.random.shuffle(active_users)
-            for u in active_users:
-                task_id = user_requests[u] - 1
-                current_s = strategies[u]
-                current_cost = self._calculate_cost_for_user(u, current_s, strategies, caching_decision, task_id)
-                best_s = current_s
-                min_cost = current_cost
-                
-                potential_strategies = list(range(self.cfg.num_channels + 1))
-                for s in potential_strategies:
-                    if s == current_s: continue
-                    cost = self._calculate_cost_for_user(u, s, strategies, caching_decision, task_id)
-                    if cost < min_cost:
-                        min_cost = cost
-                        best_s = s
-                if best_s != current_s:
-                    strategies[u] = best_s
-                    changed = True
-            if not changed:
-                break
-        return strategies
-
-    def step(self, action):
-        next_state = self._generate_requests()
-        # [新增] 计算缓存命中率 (仅供观察)
-        # action 是 0/1 向量, next_state 是用户请求
-        hits = 0
-        total_reqs = 0
-        for u in range(self.cfg.num_users):
-            req_id = next_state[u]
-            if req_id > 0: # 0 是无请求
-                total_reqs += 1
-                if action[req_id-1] == 1:
-                    hits += 1
-        hit_rate = hits / (total_reqs + 1e-9)
-
-        # 纳什均衡计算
-        final_strategies = self.find_nash_equilibrium(action, next_state)
-        
-        total_energy = 0
-        penalty_count = 0
-        for u in range(self.cfg.num_users):
-            req = next_state[u]
-            if req == 0: continue
-            task_id = req - 1
-            s = final_strategies[u]
-            energy = self._calculate_cost_for_user(u, s, final_strategies, action, task_id)
-            
-            # [技巧] Reward Clipping: 把能耗缩放到 [-1, 0] 之间，防止数值过大
-            # 正常 energy ~0.5 -> -0.5
-            # 罚分 energy ~2.0 -> -2.0
-            total_energy += energy
-            
-            if energy > self.cfg.penalty * 0.8: 
-                penalty_count += 1
-
-        reward = -total_energy
-        # 归一化 Reward，让神经网络更好训练 (除以用户数)
-        reward = reward / self.cfg.num_users 
-
-        return next_state, reward, False, penalty_count, hit_rate
+        self.beta_t[:] = 0
+        self.mu_positions = self._random_mu_positions()
+        self.xi_t = self._generate_requests()
+        return self._state_representation()
 
     def _generate_requests(self):
-        # 强 Zipf，降低学习难度
-        probs = 1.0 / (np.arange(1, self.cfg.num_services + 2)**1.5)
-        probs = probs / probs.sum()
-        return np.random.choice(np.arange(0, self.cfg.num_services + 1), 
-                              size=self.cfg.num_users, 
-                              p=probs)
+        # 论文中 ξ^t 用随机函数模拟，我们这里：每个 MU 以 0.7 概率请求一类服务
+        p_req = 0.7
+        xi = []
+        for _ in range(self.U):
+            if self.rng.random() < p_req:
+                task_k = self.rng.integers(1, self.K + 1)
+                xi.append(task_k)
+            else:
+                xi.append(0)
+        return np.array(xi, dtype=int)
 
-# ==========================================
-# 7. 主循环
-# ==========================================
+    def _state_representation(self):
+        # 和你之前一样，用“任务请求直方图 / U”作为状态（K 维向量）
+        hist = np.zeros(self.K, dtype=float)
+        for v in self.xi_t:
+            if v != 0:
+                hist[v - 1] += 1
+        state = hist / float(self.U)
+        return state.astype(np.float32)
+
+    def step(self, beta_next):
+        beta_next = np.array(beta_next, dtype=int)
+
+        # 生成下一时隙请求
+        xi_next = self._generate_requests()
+
+        total_energy = 0.0
+
+        # 简化卸载决策：每个 MU 在本地 / 边缘 / 云中选能耗最小且满足时延约束的一种
+        for u in range(self.U):
+            req = xi_next[u]
+            if req == 0:
+                continue
+            k = req - 1
+
+            I_k = self.I_k[k]
+            D_k = self.D_k[k]
+            S_k = self.S_k[k]
+
+            # 1) 本地执行
+            f_local = max(self.f_local_min, S_k / self.tau)
+            E_local = self.zeta * (f_local ** 2) * S_k
+            D_local = S_k / f_local
+            if D_local > self.tau:
+                E_local = float("inf")
+
+            # 2) 边缘执行（要求服务已缓存）
+            r_ue = self._uplink_rate(u, n_users_on_same_channel=1)
+            D_edge = S_k / self.f_e + I_k / r_ue
+            if D_edge <= self.tau and beta_next[k] == 1:
+                E_edge = self.p_edge_trans * I_k / r_ue + self.p_edge_exec * S_k / self.f_e
+            else:
+                E_edge = float("inf")
+
+            # 3) 云执行
+            D_cloud = S_k / self.f_c + I_k / r_ue + I_k / self.r_ec
+            if D_cloud <= self.tau:
+                E_cloud = self.p_cloud * (I_k / r_ue + I_k / self.r_ec)
+            else:
+                E_cloud = float("inf")
+
+            E_candidates = [E_local, E_edge, E_cloud]
+            E_u_best = min(E_candidates)
+            if not np.isfinite(E_u_best):
+                E_u_best = 1e3  # 作为惩罚
+
+            total_energy += E_u_best
+
+        reward = -total_energy   # 论文目标：最小化总能耗
+
+        self.beta_t = beta_next
+        self.xi_t = xi_next
+        next_state = self._state_representation()
+        done = False
+        return next_state, reward, done, {}
+
+
+# ========== D3QN 网络（保持你原来的 dueling + per-task Q） ==========
+class D3QNNet(nn.Module):
+    def __init__(self, state_dim, task_count, hidden1=300, hidden2=400):
+        super(D3QNNet, self).__init__()
+        self.feature_layer = nn.Sequential(
+            nn.Linear(state_dim, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+        )
+        self.value_layer = nn.Linear(hidden2, 1)
+        self.adv_layer = nn.Linear(hidden2, task_count)
+
+    def forward(self, state):
+        x = self.feature_layer(state)
+        value = self.value_layer(x)       # (B,1)
+        advantage = self.adv_layer(x)     # (B,K)
+        adv_mean = advantage.mean(dim=1, keepdim=True)
+        q_part = value + (advantage - adv_mean)
+        return q_part                     # (B,K)
+
+
+# ========== 简单 Replay Buffer（大小 = Table I 的 1000） ==========
+class ReplayMemory:
+    def __init__(self, capacity=1000):
+        self.capacity = capacity
+        self.buffer = []
+        self.pos = 0
+
+    def push(self, s, a, r, ns, done):
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(None)
+        self.buffer[self.pos] = (s, a, r, ns, done)
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.buffer, batch_size)
+
+    def __len__(self):
+        return len(self.buffer)
+
+
+# ========== D3QN Agent（参数参考论文：lr=1e-3, gamma=0.95, buffer=1000） ==========
+class D3QNAgent:
+    def __init__(
+        self,
+        state_dim,
+        task_count,
+        cache_sizes,
+        cache_capacity,
+        lr=1e-3,
+        gamma=0.95,
+        epsilon_start=1.0,
+        epsilon_end=0.05,
+        epsilon_decay=0.999,
+        target_tau=0.01,
+        device=DEVICE,
+    ):
+        self.state_dim = state_dim
+        self.K = task_count
+        self.cache_sizes = np.array(cache_sizes, dtype=float)
+        self.capacity = float(cache_capacity)
+
+        self.gamma = gamma
+        self.epsilon = epsilon_start
+        self.epsilon_end = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self.target_tau = target_tau
+        self.device = device
+
+        self.eval_net = D3QNNet(state_dim, task_count).to(device)
+        self.target_net = D3QNNet(state_dim, task_count).to(device)
+        self.target_net.load_state_dict(self.eval_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.eval_net.parameters(), lr=lr)
+        self.memory = ReplayMemory(capacity=1000)
+        self.learn_step = 0
+
+    def select_action(self, state, greedy=False):
+        if isinstance(state, np.ndarray):
+            s_tensor = torch.from_numpy(state).unsqueeze(0).float().to(self.device)
+        else:
+            s_tensor = state.unsqueeze(0).float().to(self.device)
+
+        eps = 0.0 if greedy else self.epsilon
+
+        if random.random() > eps:
+            with torch.no_grad():
+                q_parts = self.eval_net(s_tensor)  # (1,K)
+                q_np = q_parts.cpu().numpy().squeeze()
+            action_vec = self._solve_knapsack(q_np)
+        else:
+            action_vec = self._random_action()
+
+        if (not greedy) and self.epsilon > self.epsilon_end:
+            self.epsilon *= self.epsilon_decay
+            if self.epsilon < self.epsilon_end:
+                self.epsilon = self.epsilon_end
+
+        return action_vec
+
+    def _random_action(self):
+        idx = list(range(self.K))
+        random.shuffle(idx)
+        total = 0.0
+        a = [0] * self.K
+        for k in idx:
+            size = self.cache_sizes[k]
+            if total + size <= self.capacity:
+                if random.random() < 0.5:
+                    a[k] = 1
+                    total += size
+        return np.array(a, dtype=int)
+
+    def _solve_knapsack(self, values):
+        K = self.K
+        # 用整数近似容量和大小（D_k 在 [1,8]，C=10，下界不高）
+        weights = self.cache_sizes.astype(int)
+        C = int(self.capacity)
+
+        dp = [0.0] * (C + 1)
+        choose = [[0] * (C + 1) for _ in range(K + 1)]
+
+        for i in range(1, K + 1):
+            w = weights[i - 1]
+            v = float(values[i - 1])
+            for cap in range(C, -1, -1):
+                if w <= cap:
+                    new_v = dp[cap - w] + v
+                    if new_v > dp[cap]:
+                        dp[cap] = new_v
+                        choose[i][cap] = 1
+
+        beta = [0] * K
+        cap = C
+        for i in range(K, 0, -1):
+            if choose[i][cap] == 1:
+                beta[i - 1] = 1
+                cap -= weights[i - 1]
+        return np.array(beta, dtype=int)
+
+    def store_transition(self, s, a, r, ns, done):
+        self.memory.push(s, a, r, ns, done)
+
+    def update(self, batch_size):
+        if len(self.memory) < batch_size:
+            return None
+
+        batch = self.memory.sample(batch_size)
+
+        states = np.stack([b[0] for b in batch], axis=0).astype(np.float32)
+        actions = np.stack([b[1] for b in batch], axis=0).astype(np.float32)
+        rewards = np.array([b[2] for b in batch], dtype=np.float32)
+        next_states = np.stack([b[3] for b in batch], axis=0).astype(np.float32)
+        dones = np.array([b[4] for b in batch], dtype=np.float32)
+
+        s_batch = torch.from_numpy(states).to(self.device)
+        a_batch = torch.from_numpy(actions).to(self.device)
+        r_batch = torch.from_numpy(rewards).to(self.device)
+        ns_batch = torch.from_numpy(next_states).to(self.device)
+        d_batch = torch.from_numpy(dones).to(self.device)
+
+        q_parts = self.eval_net(s_batch)                      # (B,K)
+        q_sa = torch.sum(q_parts * a_batch, dim=1)            # (B,)
+
+        with torch.no_grad():
+            next_q_eval = self.eval_net(ns_batch)             # (B,K)
+            next_actions = []
+            for i in range(next_q_eval.size(0)):
+                q_np = next_q_eval[i].cpu().numpy()
+                beta_best = self._solve_knapsack(q_np)
+                next_actions.append(beta_best)
+            next_actions = np.stack(next_actions, axis=0).astype(np.float32)
+            next_actions_t = torch.from_numpy(next_actions).to(self.device)
+
+            next_q_target = self.target_net(ns_batch)         # (B,K)
+            q_next = torch.sum(next_q_target * next_actions_t, dim=1)
+
+            target = r_batch + self.gamma * q_next * (1.0 - d_batch)
+
+        loss = nn.MSELoss()(q_sa, target)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # soft update
+        with torch.no_grad():
+            for tp, ep in zip(self.target_net.parameters(), self.eval_net.parameters()):
+                tp.data.copy_(self.target_tau * ep.data + (1.0 - self.target_tau) * tp.data)
+
+        self.learn_step += 1
+        return loss.item()
+
+
+# ========== 训练主程序 ==========
 if __name__ == "__main__":
-    env = MECEnvironment(cfg)
-    agent = D3QNAgent(cfg)
-    
-    # 预热 Replay Buffer：先随机跑一会，不训练
-    print("正在预热 Replay Buffer...")
-    state = env.reset()
-    for _ in range(cfg.batch_size * 5):
-        action = agent.select_action(state)
-        # 这里 step 的返回值要对应上面的修改
-        next_state, reward, done, pens, hit_rate = env.step(action)
-        agent.store_experience(state, action, reward, next_state)
-        state = next_state
-        
-    episodes = 2000 # 可以跑少一点，因为我们减慢了 decay
-    print(f"开始训练 | 罚分: {cfg.penalty} | 衰减: {cfg.epsilon_decay}")
-    
-    for e in range(episodes):
+    random.seed(0)
+    np.random.seed(0)
+    torch.manual_seed(0)
+
+    env = ServiceCachingEnvTable1(
+        num_users=2000,
+        num_tasks=40,
+        cache_capacity_gb=10.0,
+        seed=0,
+    )
+
+    agent = D3QNAgent(
+        state_dim=env.K,
+        task_count=env.K,
+        cache_sizes=env.D_k,
+        cache_capacity=env.C,
+        device=DEVICE,
+    )
+
+    num_episodes = 800      # 2000 MU * 40 任务，单次 episode 已经很重了，先跑 800 看趋势
+    max_steps = 30          # 每个 episode 内的时隙数
+    batch_size = 128
+
+    returns = []
+
+    for ep in range(num_episodes):
         state = env.reset()
-        total_reward = 0
-        total_penalties = 0
-        total_hits = 0
-        
-        for t in range(20): 
+        episode_return = 0.0
+
+        for t in range(max_steps):
             action = agent.select_action(state)
-            next_state, reward, done, pens, hit_rate = env.step(action)
-            agent.store_experience(state, action, reward, next_state)
-            
-            loss = agent.update() # 每次 step 都更新
-            
+            next_state, reward, done, info = env.step(action)
+
+            agent.store_transition(state, action, reward, next_state, done)
+            loss = agent.update(batch_size)
+
+            episode_return += reward
             state = next_state
-            total_reward += reward
-            total_penalties += pens
-            total_hits += hit_rate
-            
-            if agent.steps % cfg.target_update == 0:
-                agent.update_target_network()
-        
-        avg_reward = total_reward / 20
-        avg_hit_rate = total_hits / 20
-        
-        if (e+1) % 20 == 0: # 打印频繁一点
-            # 观察 agent 的 epsilon 还有多少
-            # 观察 Hit Rate 是否上升 (这比 Reward 更直观)
-            print(f"Ep {e+1:4d} | Rew: {avg_reward:.3f} | Pens: {total_penalties:3d} | HitRate: {avg_hit_rate:.2f} | Eps: {agent.epsilon:.3f}")
-            
-            # [Debug] 每100轮看一眼 Agent 到底想缓存哪些服务 (Top 5 Advantage)
-            if (e+1) % 100 == 0:
-                with torch.no_grad():
-                    test_state = to_onehot(state, cfg)
-                    test_tensor = torch.FloatTensor(test_state).to(cfg.device)
-                    _, adv = agent.policy_net(test_tensor)
-                    adv = adv.cpu().numpy()[0]
-                    # 打印 Advantage 最大的前5个服务的 ID
-                    top_k_idx = np.argsort(adv)[-10:][::-1]
-                    print(f"   >>> 当前模型倾向于缓存的服务 ID: {top_k_idx}")
-                    print(f"   >>> (服务 0,1,2... 应该是最热门的，如果包含这些说明学会了)")
+            if done:
+                break
+
+        returns.append(episode_return)
+
+        if (ep + 1) % 20 == 0:
+            recent = returns[-100:] if len(returns) >= 100 else returns
+            avg_recent = sum(recent) / len(recent)
+            print(
+                f"Episode {ep+1}: Return = {episode_return:.2f}, "
+                f"Avg(Last {len(recent)}) = {avg_recent:.2f}, "
+                f"epsilon={agent.epsilon:.3f}"
+            )
+
+    print("训练完成。")
