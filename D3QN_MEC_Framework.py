@@ -11,9 +11,12 @@ import copy
 # ==========================================
 def setup_seed(seed):
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
     torch.backends.cudnn.deterministic = True
 
 setup_seed(42)
@@ -23,53 +26,55 @@ setup_seed(42)
 # ==========================================
 class Config:
     def __init__(self):
-        self.num_users = 20      
-        self.num_services = 40   
-        self.cache_capacity = 10 
-        self.num_channels = 5    
-        
+        self.num_users = 20
+        self.num_services = 40
+        self.cache_capacity = 10
+        self.num_channels = 5
+
+        # 状态是长度为 num_services+1 的直方图
         self.feature_dim = self.num_services + 1
-        
+
         # RL 参数
         self.gamma = 0.95
         self.epsilon_start = 1.0
-        self.epsilon_end = 0.05       # [修改] 保持 5% 的随机性，不要降到 0.01
-        
-        # [核心修改] 衰减极慢，确保前 1000 Episode 都在大量探索
-        # 0.9995^20000_steps approx 0.05
-        self.epsilon_decay = 0.9995   
-        
-        self.learning_rate = 0.0003   # [修改] 再小一点，求稳
-        self.batch_size = 64          # [修改] 小 Batch 更新更频繁
-        self.memory_size = 10000      # [修改] 增大 Buffer
-        self.target_update = 200      # [修改] Target 网络更新慢一点
+        self.epsilon_end = 0.05  # 保持 5% 的随机性
+        self.epsilon_decay = 0.9995  # 衰减极慢
+
+        self.learning_rate = 0.0003
+        self.batch_size = 64
+        self.memory_size = 10000
+        self.target_update = 200
         self.hidden_dim_1 = 256
         self.hidden_dim_2 = 256
 
-        # 物理参数
-        self.task_input_sizes = np.random.uniform(0.5, 1.5, size=self.num_services) # [微调] 稍微小一点
-        self.service_sizes = np.random.randint(1, 4, size=self.num_services)        
-        self.task_cycles = self.task_input_sizes * 0.5 
-        
-        self.time_slot_limit = 0.3    
-        self.bandwidth = 20e6         
-        self.noise_power = 1e-13      
-        self.trans_power_user = 0.5   
-        
-        self.f_local = 1.0e9          
-        self.f_edge = 20.0e9          
-        self.f_cloud = 100.0e9        
-        self.rate_fiber = 100 * 1e6    
+        self.task_input_sizes = np.random.uniform(0.5, 1.5, size=self.num_services)
+        self.service_sizes = np.random.randint(1, 4, size=self.num_services)
+        self.task_cycles = self.task_input_sizes * 0.5
 
-        # [核心修改] 降低罚分，让梯度更平滑
-        # 正常能耗 ~0.5, 罚分设为 2.0 足够让 AI 感到“痛”，但不至于梯度爆炸
-        self.penalty = 2.0           
-        
-        self.zeta = 1e-28             
-        self.p_exe_edge = 1.0         
-        self.game_max_iter = 20       
+        self.time_slot_limit = 0.3
+        self.bandwidth = 20e6
+        self.noise_power = 1e-13
+        self.trans_power_user = 0.5
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.f_local = 1.0e9
+        self.f_edge = 20.0e9
+        self.f_cloud = 100.0e9
+        self.rate_fiber = 100 * 1e6
+
+        self.penalty = 2.0
+        self.zeta = 1e-28
+        self.p_exe_edge = 1.0
+        self.game_max_iter = 20
+
+        # 设备选择：MPS / CUDA / CPU
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        print("Using device:", self.device)
 
 cfg = Config()
 
@@ -109,21 +114,21 @@ def to_onehot(state_arr, cfg):
     修改版：将状态转换为 [batch, num_services + 1] 的请求计数向量（直方图）
     """
     if len(state_arr.shape) == 1:
-        state_arr = state_arr[np.newaxis, :] 
+        state_arr = state_arr[np.newaxis, :]
     
     batch_size = state_arr.shape[0]
     num_classes = cfg.num_services + 1
     
     # 只需要统计每个服务被请求了多少次
     hist_state = np.zeros((batch_size, num_classes), dtype=np.float32)
-    
+
     for i in range(batch_size):
         for u in range(cfg.num_users):
             val = int(state_arr[i, u])
             hist_state[i, val] += 1.0 # 计数+1
-    
+
     # 可选：归一化，让数值在 0-1 之间，利于神经网络训练
-    hist_state = hist_state / cfg.num_users 
+    hist_state = hist_state / cfg.num_users
             
     return hist_state
 
