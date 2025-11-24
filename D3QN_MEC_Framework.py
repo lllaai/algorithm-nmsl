@@ -28,7 +28,7 @@ class Config:
         self.cache_capacity = 10 
         self.num_channels = 5    
         
-        self.feature_dim = self.num_users * (self.num_services + 1)
+        self.feature_dim = self.num_services + 1
         
         # RL 参数
         self.gamma = 0.95
@@ -106,25 +106,26 @@ class D3QN_Network(nn.Module):
 # ==========================================
 def to_onehot(state_arr, cfg):
     """
-    将 [batch, num_users] 的整数状态转换为 [batch, num_users * (num_services+1)] 的 One-Hot 向量
+    修改版：将状态转换为 [batch, num_services + 1] 的请求计数向量（直方图）
     """
     if len(state_arr.shape) == 1:
-        state_arr = state_arr[np.newaxis, :] # 增加 batch 维度
+        state_arr = state_arr[np.newaxis, :] 
     
     batch_size = state_arr.shape[0]
     num_classes = cfg.num_services + 1
     
-    # 创建 One-Hot 容器
-    one_hot = np.zeros((batch_size, cfg.num_users, num_classes), dtype=np.float32)
+    # 只需要统计每个服务被请求了多少次
+    hist_state = np.zeros((batch_size, num_classes), dtype=np.float32)
     
-    # 填充
     for i in range(batch_size):
         for u in range(cfg.num_users):
-            val = state_arr[i, u]
-            one_hot[i, u, int(val)] = 1.0
+            val = int(state_arr[i, u])
+            hist_state[i, val] += 1.0 # 计数+1
+    
+    # 可选：归一化，让数值在 0-1 之间，利于神经网络训练
+    hist_state = hist_state / cfg.num_users 
             
-    # Flatten: [batch, num_users * num_classes]
-    return one_hot.reshape(batch_size, -1)
+    return hist_state
 
 # ==========================================
 # 4. 背包算法
