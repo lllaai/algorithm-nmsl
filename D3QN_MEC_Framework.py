@@ -374,4 +374,4 @@ if __name__ == "__main__":
         avg_reward = total_reward / 20
         
         if (e+1) % 50 == 0:
-            print(f"Episode {e+1}/{episodes}, Avg Reward: {avg_reward:.2f}, Epsilon: {agent.epsilon:.2f}, Timeouts: {total_penalties}")
+            print(f"Episode {e+1}/{episodes}, Avg Reward: {avg_reward:.2f}, Epsilon: {agent.epsilon:.2f}, Timeouts: {total_penalties}") #haha
